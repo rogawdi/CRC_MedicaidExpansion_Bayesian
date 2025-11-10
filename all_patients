@@ -116,7 +116,13 @@ table(seer_crc$stage_group, useNA = "ifany")
 # seer_crc <- seer_crc %>%
 #   filter(stage_group != "IV"
 #   )
-# # View new age categories
+
+
+## Filter out age >50
+# seer_crc <- seer_crc %>%
+#   filter(age_range != c("50-54", "55-59", "60-64")
+#   )
+
 
 seer_crc$Median.household.income.inflation.adj.to.2023 <- factor(seer_crc$Median.household.income.inflation.adj.to.2023)  # Median household 
 seer_crc$Rural.Urban.Continuum.Code <- factor(seer_crc$Rural.Urban.Continuum.Code)  # Rural/urban continuum
