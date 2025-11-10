@@ -25,6 +25,8 @@ Workflow Overview
 	•	Recode state identifiers into Medicaid expansion groups:
 Non-Expansion (0), Early (1), On-Time (2), Late (3).
 	•	Generate covariates: stage group, income and state-level quintiles, marital group, age category, and survival time truncated at 36 months.
+	•	Here we have commented code for filtering out Stage IV disease (isolating patients with metastatic disease) and patients >50 years old. 
+		- ensure output paths are changed accordingly to avoid non-metastatic patient or EOCRC analyses do not overwrite whole population data. 
 
 2 – Stage and Surgery Coding
 	•	Collapse SEER stage into four groups (I–IV).
