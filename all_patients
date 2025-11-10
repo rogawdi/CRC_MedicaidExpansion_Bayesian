@@ -1,0 +1,2765 @@
+## Bayesian Hierarchical Regression 
+
+### 3 year with all 3 expansion groups ###
+
+### PSM with all patients ##
+
+## 1.  Load necessary libraries
+library(survival)
+library(survminer)
+# library(flexsurv) # for flexible parametric model
+library(dplyr)
+library(broom)
+library(Matching)
+library(MatchIt)
+library(nnet)
+library(cobalt)
+library(data.table)
+library(rgenoud)
+library(tidyr)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(broom)
+library(scales)
+library(sandwich)
+library(lmtest)
+library(purrr)
+library(ggpubr)
+library(usmap)
+library(survRM2)
+library(brm)
+library(rstanarm)
+
+
+## 2. SEER Variable Coding
+
+# Read in the dataset
+seer_crc <- read.csv("../input/crc_allstages_all.csv")
+
+
+
+# Define Medicaid expansion categories
+seer_crc$Medicaid.Expansion.Status <- tolower(seer_crc$Medicaid.Expansion.Status)
+
+seer_crc$Medicaid_Expansion_Status <- as.factor(seer_crc$Medicaid.Expansion.Status)
+
+# this can stay the same i think
+seer_crc <- seer_crc %>%
+  mutate(dx.yr_grouped = case_when(
+    dx.yr >= 2006 & dx.yr <= 2010 ~ "2006-2010",
+    dx.yr >= 2011 & dx.yr <= 2013 ~ "2011-2013",
+    dx.yr >= 2014 & dx.yr <= 2016 ~ "2014-2016",
+    dx.yr >= 2017 & dx.yr <= 2019 ~ "2017-2019",
+    TRUE ~ NA_character_
+  ))
+
+# set eras as factors
+seer_crc$dx.yr_grouped <- factor(seer_crc$dx.yr_grouped)
+
+seer_crc <- seer_crc %>%
+  mutate(
+    Medicaid_Expansion_Status = case_when(
+      # 2006-2010: Assign pre-expansion groups based on future expansion
+      dx.yr_grouped == "2006-2010" & Medicaid.Expansion.Status %in% c("california", "connecticut", "new jersey", "seattle (puget sound)") ~ 1,  # future EARLY expander
+      dx.yr_grouped == "2006-2010" & Medicaid.Expansion.Status %in% c("iowa", "hawaii", "kentucky", "new mexico") ~ 2,  # future ON TIME expander
+      dx.yr_grouped == "2006-2010" & Medicaid.Expansion.Status %in% c("louisiana", "alaska natives") ~ 3,  # future LATE expander
+      dx.yr_grouped == "2006-2010" ~ 0,  # Never expanders stay 0
+      
+      # 2010-2013: First expansion
+      dx.yr_grouped == "2011-2013" & Medicaid.Expansion.Status %in% c("california", "connecticut", "new jersey", "seattle (puget sound)") ~ 1,  # NEW expander
+      dx.yr_grouped == "2011-2013" & Medicaid.Expansion.Status %in% c("iowa", "hawaii", "kentucky", "new mexico") ~ 2,  # future expander
+      dx.yr_grouped == "2011-2013" & Medicaid.Expansion.Status %in% c("louisiana", "alaska natives") ~ 3,  # future expander
+      dx.yr_grouped == "2011-2013" ~ 0,  
+      
+      # 2014-2016: Second expansion
+      dx.yr_grouped == "2014-2016" & Medicaid.Expansion.Status %in% c("iowa", "hawaii", "kentucky", "new mexico") ~ 2,  #new expander
+      dx.yr_grouped == "2014-2016" & Medicaid.Expansion.Status %in% c("california", "connecticut", "new jersey", "seattle (puget sound)") ~ 1,  #already expanded
+      dx.yr_grouped == "2014-2016" & Medicaid.Expansion.Status %in% c("louisiana", "alaska natives") ~ 3,  # future expander
+      dx.yr_grouped == "2014-2016" ~ 0,  
+      
+      # 2017-2019: Final expansion
+      dx.yr_grouped == "2017-2019" & Medicaid.Expansion.Status %in% c("louisiana", "alaska natives") ~ 3,  # new expander
+      dx.yr_grouped == "2017-2019" & Medicaid.Expansion.Status %in% c("iowa", "hawaii", "kentucky", "new Mexico") ~ 2,  #already expanded
+      dx.yr_grouped == "2017-2019" & Medicaid.Expansion.Status %in% c("california", "connecticut", "new jersey", "seattle (puget sound)") ~ 1,  #already expanded
+      dx.yr_grouped == "2017-2019" ~ 0,  
+      
+      TRUE ~ 0  # Default: No expansion
+    )
+  )
+
+# seer_crc$Medicaid.Expansion.Status <- relevel(seer_crc$Medicaid.Expansion.Status, ref = "0")
+
+
+
+# Check if mapping was successful:
+table(seer_crc$Medicaid_Expansion_Status)
+
+# Convert categorical variables into factors
+seer_crc$Age <- factor(seer_crc$Age)  # Age grouped by 5 years
+
+
+seer_crc$Combined.Stage <- factor(seer_crc$Combined.Stage)
+stage_map <- data.frame(
+  stage_range = c("Stage I", "Stage IIA", "Stage IIB", "Stage IIIA", "Stage IIIB+C", "Stage IV"),
+  stage_group = c("I", "II", "II", "III", "III", "IV")
+) 
+
+# Merge SEER dataset with age categories
+seer_crc <- seer_crc %>%
+  left_join(stage_map, by = c("Combined.Stage" = "stage_range"))
+
+# # # View new age categories
+table(seer_crc$stage_group, useNA = "ifany")
+
+## Filter out stage IV disease
+# seer_crc <- seer_crc %>%
+#   filter(stage_group != "IV"
+#   )
+# # View new age categories
+
+seer_crc$Median.household.income.inflation.adj.to.2023 <- factor(seer_crc$Median.household.income.inflation.adj.to.2023)  # Median household 
+seer_crc$Rural.Urban.Continuum.Code <- factor(seer_crc$Rural.Urban.Continuum.Code)  # Rural/urban continuum
+#seer_crc <- seer_crc %>%
+#  filter(!grepl("Unknown/missing/no match", trimws(Rural.Urban.Continuum.Code)))
+seer_crc$Marital.status.at.diagnosis <- factor(seer_crc$Marital.status.at.diagnosis)  # Marital status
+# seer_crc$Marital.status.at.diagnosis <- relevel(seer_crc$Marital.status.at.diagnosis, ref = "Married (including common law)") # make Married the reference
+
+seer_crc$Race <- factor(seer_crc$Race)  # Race/ethnicity
+seer_crc$Race <- relevel(seer_crc$Race, ref = "White") # make NH White the reference
+
+
+# Group Radiation recodes
+seer_crc$RX.Summ..Systemic.Sur.Seq..2007.. <- factor(seer_crc$RX.Summ..Systemic.Sur.Seq..2007..)  # Systemic therapy timing
+
+
+seer_crc$Sex <- factor(seer_crc$Sex, levels = c("Male", "Female"))
+# Group Surgery recodes
+seer_crc$Surgery.Performed <- factor(seer_crc$Surgery.Performed)  # Surgery Status
+
+seer_crc$Surgery.Performed <- factor(seer_crc$Surgery.Performed)  # Surgery
+surg_map <- data.frame(
+  surg_range = c("Surgery performed", 
+                 "Not performed, patient died prior to recommended surgery", 
+                 "Not recommended",
+                 "Not recommended, contraindicated due to other cond; autopsy only (1973-2002)",
+                 "Recommended but not performed, patient refused",
+                 "Recommended but not performed, unknown reason",
+                 "Recommended, unknown if performed",
+                 "Unknown; death certificate; or autopsy only (2003+)"),
+  surgery_status = c("Recommended + performed", 
+                     "Recommended, not performed",
+                     "Not recommended/unknown",
+                     "Not recommended/unknown",
+                     "Recommended, not performed",
+                     "Recommended, not performed",
+                     "Recommended, not performed",
+                     "Not recommended/unknown")
+)
+
+# Merge SEER dataset with surgery categories
+seer_crc <- seer_crc %>%
+  left_join(surg_map, by = c("Surgery.Performed" = "surg_range"))
+
+# Convert surgery_status to a factor if it's not already
+seer_crc$surgery_status <- factor(seer_crc$surgery_status)
+
+# Now, relevel the factor
+seer_crc$surgery_status <- relevel(seer_crc$surgery_status, ref = "Recommended + performed")
+
+# # # View new age categories
+table(seer_crc$surgery_status, useNA = "ifany")
+
+
+
+# Create a binary event indicator (1 = death, 0 = alive)
+seer_crc$Event <- ifelse(seer_crc$Vital.status.recode..study.cutoff.used. == "Dead", 1, 0)
+
+# Convert Time into numeric variable
+seer_crc$Survival.months <- as.numeric(as.character(seer_crc$Survival.months))
+seer_crc <- seer_crc[!is.na(seer_crc$Survival.months), ]
+
+# INCOME QUINTILE
+# Define income ranges and assign midpoints
+income_map <- data.frame(
+  income_range = c("< $40,000", "$40,000 - $44,999", "$45,000 - $49,999",
+                   "$50,000 - $54,999", "$55,000 - $59,999", "$60,000 - $64,999",
+                   "$65,000 - $69,999", "$70,000 - $74,999", "$75,000 - $79,999",
+                   "$80,000 - $84,999", "$85,000 - $89,999", "$90,000 - $94,999",
+                   "$95,000 - $99,999", "$100,000 - $109,999", "$110,000 - $119,999",
+                   "$120,000+"),
+  midpoint = c(35000, 42500, 47500, 52500, 57500, 62500, 67500, 72500, 77500, 
+               82500, 87500, 92500, 97500, 105000, 115000, 125000)
+)
+
+
+seer_crc <- seer_crc %>%
+  left_join(income_map, by = c("Median.household.income.inflation.adj.to.2023" = "income_range"))
+
+quintile_cutoffs <- quantile(seer_crc$midpoint, probs = seq(0, 1, 0.2), na.rm = TRUE)
+
+seer_crc <- seer_crc %>%
+  mutate(income_quintile = ntile(midpoint, 5))
+
+# seer_crc$income_quintile <- relevel(seer_crc$income_quintile, ref = "Q3")
+
+seer_crc <- seer_crc %>%
+  filter(!grepl("<NA>", trimws(income_quintile)))
+
+# # # View result
+table(seer_crc$income_quintile, useNA = "ifany")
+
+
+### State by State population income quintiles ### 
+
+# 1. Create a new variable for state-specific income quintiles
+seer_crc <- seer_crc %>%
+  group_by(Medicaid.Expansion.Status) %>%
+  mutate(
+    state_income_quintile = ntile(midpoint, 5)  # Split income into quintiles within each state
+  ) %>%
+  ungroup()
+
+# 2. Create a 'stats' flag for the lowest 2 quintiles within each state
+seer_crc <- seer_crc %>%
+  mutate(
+    stats_flag = ifelse(state_income_quintile %in% c(1, 2), 1, 0)
+  )
+
+# 3. Optional: If you want to see the quintile ranges by state
+state_income_ranges <- seer_crc %>%
+  filter(!is.na(midpoint)) %>%  # Exclude NA values
+  group_by(Medicaid.Expansion.Status, state_income_quintile) %>%
+  summarize(
+    min_income = min(midpoint, na.rm = TRUE),
+    max_income = max(midpoint, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 5. # View or export the quintile cutoffs table
+print(state_income_ranges)
+write.csv(state_income_ranges, "supplement/state_income_quintile_cutoffs.csv", row.names = FALSE)
+
+
+# AGE GROUPS
+# Create a mapping of age groups
+age_map <- data.frame(
+  age_range = c("20-24 years", "25-29 years", "30-34 years", "35-39 years",
+                "40-44 years", "45-49 years", "50-54 years", "55-59 years", "60-64 years"),
+  age_category = c("Young Adult", "Young Adult", "Young Adult", "Young Adult",
+                   "Young Adult", "Young Adult", "Middle-Aged", "Middle-Aged",
+                   "Older Adult")
+)
+
+# Merge SEER dataset with age categories
+seer_crc <- seer_crc %>%
+  left_join(age_map, by = c("Age" = "age_range"))
+
+# # # View new age categories
+table(seer_crc$age_category, useNA = "ifany")
+
+#Truncate survival at 36 months
+seer_crc <- seer_crc %>%
+  mutate(capped_time = pmin(Survival.months, 36))
+
+
+seer_crc$Marital_Grouped <- factor(ifelse(
+  seer_crc$Marital.status.at.diagnosis %in% c("Married (including common law)", "Unmarried or Domestic Partner"), "Married",
+  ifelse(seer_crc$Marital.status.at.diagnosis %in% c("Divorced", "Separated", "Widowed"), "Previously Married", "Single/Unknown")
+))
+
+table(seer_crc$Marital_Grouped)
+
+# seer_crc$Marital_Grouped <- relevel(seer_crc$Marital_Grouped, ref = "Single/Unknown")
+
+seer_crc$capped_time <- pmin(seer_crc$Survival.months, 36)
+seer_crc$capped_event <- ifelse(seer_crc$Survival.months > 36, 0, seer_crc$Event)
+
+
+
+## 3. Unmatched Stage Shift 
+
+#### Bayesian Stage + Surgery Receipt ####
+library(rstan)
+library(stringr)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+set.seed(20251103)
+
+
+# --- Helper to coerce stage into I+II vs III+IV -----------------------------
+make_stage12_vs_34 <- function(df, stage_var = "stage_group") {
+  sg <- df[[stage_var]]
+  
+  # Try common encodings
+  # Case A: roman numerals as strings ("I","II","III","IV")
+  romans <- c("I","II","III","IV")
+  if (all(na.omit(as.character(sg)) %in% romans)) {
+    s_num <- dplyr::recode(as.character(sg), I=1L, II=2L, III=3L, IV=4L, .default=NA_integer_)
+  } else {
+    # Case B: numeric-like factors "1","2","3","4"
+    s_chr <- as.character(sg)
+    s_num <- suppressWarnings(as.integer(s_chr))
+    # Case C fallback: try to parse if labels contain words
+    bad <- is.na(s_num) & !is.na(s_chr)
+    if (any(bad)) {
+      s_num[bad] <- dplyr::case_when(
+        str_detect(s_chr[bad], regex("^I{1}$", ignore_case=TRUE)) ~ 1L,
+        str_detect(s_chr[bad], regex("^II{1}$", ignore_case=TRUE)) ~ 2L,
+        str_detect(s_chr[bad], regex("^III{1}$", ignore_case=TRUE)) ~ 3L,
+        str_detect(s_chr[bad], regex("^IV{1}$", ignore_case=TRUE)) ~ 4L,
+        TRUE ~ NA_integer_
+      )
+    }
+  }
+  
+  df$stage_num <- s_num
+  # Outcome: 1 = Stage I+II, 0 = Stage III+IV
+  df$stage12 <- ifelse(!is.na(df$stage_num), as.integer(df$stage_num <= 2L), NA_integer_)
+  df
+}
+
+# --- Helper to coerce surgery receipt to binary -----------------------------
+# Adjust the positive levels below if your factor levels differ (print levels first)
+make_surgery_binary <- function(df, surg_var = "surgery_status") {
+  sx <- as.character(df[[surg_var]])
+  df$surgery_bin <- ifelse(
+    is.na(sx), NA_integer_,
+    ifelse(sx == "Recommended + performed", 1L, 0L)
+  )
+  df
+}
+
+# --- Build DiD pre/post windows per expansion timing -----------------------
+add_prepost_by_timing <- function(df, timing = c("Early","On-Time","Late"),
+                                  year_var = "dx.yr_grouped",
+                                  group_var = "Medicaid_Expansion_Status") {
+  timing <- match.arg(timing)
+  
+  # Define timing windows based on your Methods
+  pre_years  <- switch(timing,
+                       "Early"   = c("2006-2010"),
+                       "On-Time" = c("2006-2013"),
+                       "Late"    = c("2006-2016"))
+  post_years <- switch(timing,
+                       "Early"   = c("2011-2013","2014-2016","2017-2019"),
+                       "On-Time" = c("2014-2016","2017-2019"),
+                       "Late"    = c("2017-2019"))
+  
+  # Keep only the treated timing vs Non-Expansion
+  df2 <- df %>%
+    filter(.data[[group_var]] %in% c(timing %>% {if(.=="On-Time") "On-Time" else .}, "Non-Expansion"),
+           .data[[year_var]] %in% c(pre_years, post_years)) %>%
+    mutate(
+      post   = factor(ifelse(.data[[year_var]] %in% post_years, "Post", "Pre"), levels = c("Pre","Post")),
+      treat  = factor(ifelse(.data[[group_var]] == timing, 1, 0), levels = c(0,1)),
+      treat_lab = timing
+    )
+  
+  df2
+}
+
+
+# Unadjusted DiD: outcome ~ post * treat
+fit_bayes_did_logistic <- function(df, outcome, chains = 4, iter = 2000) {
+  f <- as.formula(paste0(outcome, " ~ post * treat"))
+  fit <- stan_glm(f,
+                  data = df,
+                  family = binomial(link = "logit"),
+                  prior = normal(0, 1, autoscale = TRUE),
+                  prior_intercept = normal(0, 5, autoscale = TRUE),
+                  chains = chains, iter = iter, seed = 20251103)
+  
+  # Find the interaction coefficient name robustly
+  cn <- colnames(as.matrix(fit))
+  # rstanarm names interactions like "postPost:treat1"
+  int_name <- cn[grepl("post.*:treat", cn, ignore.case = TRUE)]
+  if (length(int_name) != 1L) warning("Interaction term detection ambiguous; check names(fit).")
+  
+  draws <- as.matrix(fit)[, int_name, drop = TRUE]
+  OR_draws <- exp(draws)
+  
+  out <- tibble(
+    term = int_name,
+    OR   = exp(coef(fit)[int_name]),
+    LCrI = quantile(OR_draws, 0.025, na.rm = TRUE),
+    UCrI = quantile(OR_draws, 0.975, na.rm = TRUE),
+    P_OR_gt_1 = mean(OR_draws > 1, na.rm = TRUE),
+    P_OR_lt_1 = mean(OR_draws < 1, na.rm = TRUE)
+  )
+  list(fit = fit, summary = out, draws = OR_draws)
+}
+
+
+
+# Start from your full dataset; use cleaned_data or cleaned_data (choose one)
+df0 <- cleaned_data
+
+# Make outcomes
+df0 <- df0 %>%
+  mutate(
+    Medicaid_Expansion_Status = factor(
+      Medicaid_Expansion_Status,
+      levels = c(0,1,2,3),
+      labels = c("Non-Expansion", "Early Expansion", "On-Time Expansion", "Late Expansion")
+    )
+  )
+
+df_early <- df0 %>%
+  filter(Medicaid_Expansion_Status %in% c("Early Expansion","Non-Expansion"),
+         dx.yr_grouped %in% c("2006-2010","2011-2013","2014-2016","2017-2019")) %>%
+  mutate(
+    post  = factor(ifelse(dx.yr_grouped %in% c("2011-2013","2014-2016","2017-2019"), "Post","Pre"),
+                   levels = c("Pre","Post")),
+    treat = factor(ifelse(Medicaid_Expansion_Status == "Early Expansion", 1, 0),
+                   levels = c(0,1))
+  ) %>%
+  filter(!is.na(stage12))
+
+# Check counts to make sure it worked
+table(df_early$Medicaid_Expansion_Status)
+table(df_early$post)
+table(df_early$treat)
+
+
+fit_stage_early <- stan_glm(
+  stage12 ~ post * treat,
+  data = df_early,
+  family = binomial(link = "logit"),
+  prior = normal(0,1,autoscale=TRUE),
+  chains = 4, iter = 2000, seed = 20251103
+)
+
+summary(fit_stage_early)
+
+library(broom.mixed)
+
+# Early
+res_stage_early <- tidyMCMC(as.data.frame(as.matrix(fit_stage_early)), conf.int = TRUE)  # optional, or:
+res_stage_early <- broom::tidy(fit_stage_early, conf.int = TRUE, exponentiate = TRUE)
+res_stage_early <- data.frame(
+  term = names(coef(fit_stage_early)),
+  OR = exp(coef(fit_stage_early)),
+  LCrI = exp(posterior_interval(fit_stage_early)[,1]),
+  UCrI = exp(posterior_interval(fit_stage_early)[,2])
+)
+# -------------------------------
+# Build the On-Time vs Non-Expansion dataset
+# -------------------------------
+df_ontime <- df0 %>%
+  filter(Medicaid_Expansion_Status %in% c("On-Time Expansion","Non-Expansion"),
+         dx.yr_grouped %in% c("2006-2010","2011-2013","2014-2016","2017-2019")) %>%
+  mutate(
+    # Post = after 2014 for On-Time expansions
+    post  = factor(ifelse(dx.yr_grouped %in% c("2014-2016","2017-2019"), "Post","Pre"),
+                   levels = c("Pre","Post")),
+    treat = factor(ifelse(Medicaid_Expansion_Status == "On-Time Expansion", 1, 0),
+                   levels = c(0,1))
+  ) %>%
+  filter(!is.na(stage12))
+
+# Check counts
+table(df_ontime$Medicaid_Expansion_Status)
+table(df_ontime$post)
+table(df_ontime$treat)
+
+# -------------------------------
+# Run the Bayesian logistic DiD for stage shift
+# -------------------------------
+fit_stage_ontime <- stan_glm(
+  stage12 ~ post * treat,
+  data = df_ontime,
+  family = binomial(link = "logit"),
+  prior = normal(0,1,autoscale=TRUE),
+  chains = 4, iter = 2000, seed = 20251103
+)
+
+summary(fit_stage_ontime)
+
+res_stage_ontime <- tidyMCMC(as.data.frame(as.matrix(fit_stage_ontime)), conf.int = TRUE)  # optional, or:
+res_stage_ontime <- broom::tidy(fit_stage_ontime, conf.int = TRUE, exponentiate = TRUE)
+res_stage_ontime <- data.frame(
+  term = names(coef(fit_stage_ontime)),
+  OR = exp(coef(fit_stage_ontime)),
+  LCrI = exp(posterior_interval(fit_stage_ontime)[,1]),
+  UCrI = exp(posterior_interval(fit_stage_ontime)[,2])
+)
+
+# -------------------------------
+# Build the Late vs Non-Expansion dataset
+# -------------------------------
+df_late <- df0 %>%
+  filter(Medicaid_Expansion_Status %in% c("Late Expansion","Non-Expansion"),
+         dx.yr_grouped %in% c("2006-2010","2011-2013","2014-2016","2017-2019")) %>%
+  mutate(
+    # Post = after 2017 for Late expansions
+    post  = factor(ifelse(dx.yr_grouped %in% c("2017-2019"), "Post","Pre"),
+                   levels = c("Pre","Post")),
+    treat = factor(ifelse(Medicaid_Expansion_Status == "Late Expansion", 1, 0),
+                   levels = c(0,1))
+  ) %>%
+  filter(!is.na(stage12))
+
+# Check counts
+table(df_late$Medicaid_Expansion_Status)
+table(df_late$post)
+table(df_late$treat)
+
+# -------------------------------
+# Run the Bayesian logistic DiD for stage shift
+# -------------------------------
+fit_stage_late <- stan_glm(
+  stage12 ~ post * treat,
+  data = df_late,
+  family = binomial(link = "logit"),
+  prior = normal(0,1,autoscale=TRUE),
+  chains = 4, iter = 2000, seed = 20251103
+)
+
+summary(fit_stage_late)
+
+res_stage_late <- tidyMCMC(as.data.frame(as.matrix(fit_stage_late)), conf.int = TRUE)  # optional, or:
+res_stage_late <- broom::tidy(fit_stage_late, conf.int = TRUE, exponentiate = TRUE)
+res_stage_late <- data.frame(
+  term = names(coef(fit_stage_late)),
+  OR = exp(coef(fit_stage_late)),
+  LCrI = exp(posterior_interval(fit_stage_late)[,1]),
+  UCrI = exp(posterior_interval(fit_stage_late)[,2])
+)
+
+library(dplyr)
+
+stage_summaries <- bind_rows(
+  res_stage_early %>% mutate(timing = "Early Expansion"),
+  res_stage_ontime %>% mutate(timing = "On-Time Expansion"),
+  res_stage_late %>% mutate(timing = "Late Expansion")
+) %>%
+  dplyr::select(timing, term, OR, LCrI, UCrI)
+
+# Print or save the combined table
+print(stage_summaries)
+
+# Optional: write to CSV
+write.csv(stage_summaries, "../bayesian/stage_shift_Bayesian_summary.csv", row.names = FALSE)
+
+df0 <- df0 %>%
+  mutate(
+    surgery_bin = ifelse(surgery_status == "Recommended + performed", 1L, 0L)
+  )
+
+
+df_early <- df0 %>%
+  filter(Medicaid_Expansion_Status %in% c("Early Expansion","Non-Expansion"),
+         dx.yr_grouped %in% c("2006-2010","2011-2013","2014-2016","2017-2019")) %>%
+  mutate(
+    post  = factor(ifelse(dx.yr_grouped %in% c("2011-2013","2014-2016","2017-2019"),"Post","Pre"),
+                   levels=c("Pre","Post")),
+    treat = factor(ifelse(Medicaid_Expansion_Status=="Early Expansion",1,0),levels=c(0,1))
+  )
+
+df_ontime <- df0 %>%
+  filter(Medicaid_Expansion_Status %in% c("On-Time Expansion","Non-Expansion"),
+         dx.yr_grouped %in% c("2006-2010","2011-2013","2014-2016","2017-2019")) %>%
+  mutate(
+    post  = factor(ifelse(dx.yr_grouped %in% c("2014-2016","2017-2019"),"Post","Pre"),
+                   levels=c("Pre","Post")),
+    treat = factor(ifelse(Medicaid_Expansion_Status=="On-Time Expansion",1,0),levels=c(0,1))
+  )
+
+df_late <- df0 %>%
+  filter(Medicaid_Expansion_Status %in% c("Late Expansion","Non-Expansion"),
+         dx.yr_grouped %in% c("2006-2010","2011-2013","2014-2016","2017-2019")) %>%
+  mutate(
+    post  = factor(ifelse(dx.yr_grouped %in% c("2017-2019"),"Post","Pre"),
+                   levels=c("Pre","Post")),
+    treat = factor(ifelse(Medicaid_Expansion_Status=="Late Expansion",1,0),levels=c(0,1))
+  )
+
+
+# Overall (all stages)
+df_early_sx  <- df_early  %>% filter(!is.na(surgery_bin))
+df_ontime_sx     <- df_ontime     %>% filter(!is.na(surgery_bin))
+df_late_sx   <- df_late   %>% filter(!is.na(surgery_bin))
+
+res_surg_early <- fit_bayes_did_logistic(df_early_sx, outcome = "surgery_bin")
+res_surg_ontime    <- fit_bayes_did_logistic(df_ontime_sx,    outcome = "surgery_bin")
+res_surg_late  <- fit_bayes_did_logistic(df_late_sx,  outcome = "surgery_bin")
+
+surgery_overall_summaries <- bind_rows(
+  res_surg_early$summary %>% mutate(timing = "Early"),
+  res_surg_ontime$summary    %>% mutate(timing = "On-Time"),
+  res_surg_late$summary  %>% mutate(timing = "Late")
+) %>%
+  dplyr::select(timing, term, OR, LCrI, UCrI, P_OR_lt_1, P_OR_gt_1)
+
+surgery_overall_summaries
+
+write.csv(surgery_overall_summaries, "../bayesian/surgery_all_Bayesian_summary.csv", row.names = FALSE)
+
+# Non-metastatic only (I–III); we already created stage_num
+df_early_nm <- df_early  %>% filter(!is.na(surgery_bin), !is.na(stage_num), stage_num <= 3L)
+df_ontime_nm    <- df_ontime    %>% filter(!is.na(surgery_bin), !is.na(stage_num), stage_num <= 3L)
+df_late_nm  <- df_late   %>% filter(!is.na(surgery_bin), !is.na(stage_num), stage_num <= 3L)
+
+res_surg_early_nm <- fit_bayes_did_logistic(df_early_nm, outcome = "surgery_bin")
+res_surg_ontime_nm    <- fit_bayes_did_logistic(df_on_nm,    outcome = "surgery_bin")
+res_surg_late_nm  <- fit_bayes_did_logistic(df_late_nm,  outcome = "surgery_bin")
+
+surgery_nm_summaries <- bind_rows(
+  res_surg_early_nm$summary %>% mutate(timing = "Early"),
+  res_surg_ontime_nm$summary    %>% mutate(timing = "On-Time"),
+  res_surg_late_nm$summary  %>% mutate(timing = "Late")
+) %>%
+  dplyr::select(timing, term, OR, LCrI, UCrI, P_OR_lt_1, P_OR_gt_1)
+
+
+surgery_nm_summaries
+
+
+# Peek at factor levels to ensure the surgery mapping is right:
+levels(cleaned_data$surgery_status)
+
+# Confirm post/treat counts per timing:
+table(df_early$treat, df_early$post)
+table(df_on$treat,    df_on$post)
+table(df_late$treat,  df_late$post)
+
+
+## 4. Propensity Score Matching
+
+seer_crc_psm <- seer_crc %>%
+  mutate(Match_Group = sample(c("match_1", "match_2", "match_3"), n(), replace = TRUE))
+
+seer_crc <- seer_crc %>%
+  mutate(capped_time = pmin(Survival.months, 36))
+# List to store results
+cox_results <- list()
+
+
+seer_crc <- seer_crc %>%
+  mutate(capped_time = pmin(Survival.months, 36))
+
+
+seer_crc$binary_group_1 <- ifelse(seer_crc$Medicaid_Expansion_Status == 0, 0,
+                                      ifelse(seer_crc$Medicaid_Expansion_Status == 1, 1, NA))
+seer_crc$binary_group_2 <- ifelse(seer_crc$Medicaid_Expansion_Status == 0, 0,
+                                      ifelse(seer_crc$Medicaid_Expansion_Status == 2, 1, NA))
+seer_crc$binary_group_3 <- ifelse(seer_crc$Medicaid_Expansion_Status == 0, 0,
+                                      ifelse(seer_crc$Medicaid_Expansion_Status == 3, 1, NA))
+
+# 
+# seer_crc$binary_group_1 <- ifelse(seer_crc$Medicaid_Expansion_Status == "Non-Expansion", 0, 
+#                                       ifelse(seer_crc$Medicaid_Expansion_Status == "Early Expansion", 1, NA))
+# seer_crc$binary_group_2 <- ifelse(seer_crc$Medicaid_Expansion_Status == "Non-Expansion", 0, 
+#                                       ifelse(seer_crc$Medicaid_Expansion_Status == "2014 Expansion", 1, NA))
+# seer_crc$binary_group_3 <- ifelse(seer_crc$Medicaid_Expansion_Status == "Non-Expansion", 0, 
+#                                       ifelse(seer_crc$Medicaid_Expansion_Status == "Late Expansion", 1, NA))
+# 
+
+
+seer_crc_cleaned_1 <- seer_crc[!is.na(seer_crc$binary_group_1), ]
+seer_crc_cleaned_2 <- seer_crc[!is.na(seer_crc$binary_group_2), ]
+seer_crc_cleaned_3 <- seer_crc[!is.na(seer_crc$binary_group_3), ]
+
+
+# Create propensity score model using logistic regression
+
+
+
+# Group 1 vs 0
+# Step 0: Filter data to complete cases for modeling
+seer_crc_cleaned_1_complete <- seer_crc_cleaned_1[complete.cases(
+  seer_crc_cleaned_1[, c("age_category", 
+                             "Race", "Sex",
+                             "RX.Summ..Systemic.Sur.Seq..2007..", "stage_group", "surgery_status", 
+                             "income_quintile", "Rural.Urban.Continuum.Code", 
+                             "Marital_Grouped")]), ]
+
+
+# Step 1: Fit Propensity Score Model
+ps_model_1 <- glm(binary_group_1 ~  age_category + Race + Combined.Stage + Rural.Urban.Continuum.Code,
+                  data = seer_crc_cleaned_1_complete, 
+                  family = "binomial")
+
+# Step 2: Attach predicted propensity scores to this filtered dataset
+seer_crc_cleaned_1_complete$pscore <- predict(ps_model_1, type = "response")
+
+# Step 3: Plot Before Matching
+ggplot(seer_crc_cleaned_1_complete, aes(x = pscore, fill = as.factor(binary_group_1))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions Before Matching for Group 1", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_before_1.png", width = 8, height = 6, dpi = 300)
+
+
+seer_crc_cleaned_1_complete$logit_pscore <- log(seer_crc_cleaned_1_complete$pscore / (1 - seer_crc_cleaned_1_complete$pscore))
+
+match_1 <- matchit(
+  binary_group_1 ~ 1,
+  data = seer_crc_cleaned_1_complete,
+  method = "nearest",
+  distance = seer_crc_cleaned_1_complete$logit_pscore,
+  caliper = 0.25,  # on logit scale
+  ratio = 2,
+  replace = FALSE
+)
+# # Step 4: Perform Matching
+# match_1 <- matchit(binary_group_1 ~ 1, 
+#                    data = seer_crc_cleaned_1_complete, 
+#                    method = "nearest", 
+#                    distance = seer_crc_cleaned_1_complete$pscore, 
+#                    ratio = 2, 
+#                    caliper = 0.25, 
+#                    replace = FALSE)
+
+# Step 5: Extract Matched Data
+matched_data_1 <- match.data(match_1)
+
+# Step 6: Plot After Matching
+ggplot(matched_data_1, aes(x = pscore, fill = as.factor(binary_group_1))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions After Matching for Group 1", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_after_1.png", width = 8, height = 6, dpi = 300)
+
+# Step 7: Covariate Balance Plot
+plot_1 <- love.plot(match_1, 
+                    binary = "raw", 
+                    threshold = 0.1, 
+                    title = "Covariate Balance: Absolute Standardized Mean Differences for Group 1") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    theme(text = element_text(family = "Times"))
+  ) +
+  labs(x = "Covariates", y = "Absolute Standardized Mean Difference")
+
+print(plot_1)
+# # ggsave("stats_results/loveplot_1.png", width = 16, height = 4, dpi = 300)
+
+
+# Step 8: Show Table of Balance
+bal.tab(match_1)
+
+# Step 5: Perform Matching with all covariates in the model
+match_1 <- matchit(
+  binary_group_1 ~ age_category + Race + Combined.Stage + Rural.Urban.Continuum.Code,
+  data = seer_crc_cleaned_1_complete,
+  method = "nearest",
+  distance = seer_crc_cleaned_1_complete$logit_pscore,
+  caliper = 0.25,  # On logit scale
+  ratio = 2,
+  replace = FALSE
+)
+
+# Step 6: Extract Matched Data
+matched_data_1 <- match.data(match_1)
+
+# Step 7: Plot Propensity Score Distributions After Matching
+ggplot(matched_data_1, aes(x = pscore, fill = as.factor(binary_group_1))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions After Matching for Group 1", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal()
+# # # ggsave("stats_results/propensity_scores_after_1.png", width = 8, height = 6, dpi = 300)
+
+
+# Check balance again
+bal.tab(match_1)
+# Step 8: Covariate Balance Plot
+plot_1 <- love.plot(match_1, 
+                    binary = "raw", 
+                    threshold = 0.1,  # Set threshold for standardized mean differences
+                    title = "Covariate Balance: Absolute Standardized Mean Differences for Group 1") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Covariates", y = "Absolute Standardized Mean Difference")
+
+
+#Print the love plot
+print(plot_1)
+# ggsave("stats_results/full_loveplot_1.png", width = 16, height = 4, dpi = 300)
+
+bal.tab(match_1)
+
+
+# Group 2 vs 0
+# Step 0: Filter data to complete cases for modeling
+seer_crc_cleaned_2_complete <- seer_crc_cleaned_2[complete.cases(
+  seer_crc_cleaned_2[, c("age_category",  
+                             "Race",
+                             "RX.Summ..Systemic.Sur.Seq..2007..", "surgery_status", 
+                             "income_quintile", "Rural.Urban.Continuum.Code", 
+                             "Marital_Grouped")]), ]
+
+# Step 1: Fit Propensity Score Model
+ps_model_2 <- glm(binary_group_2 ~ age_category + Combined.Stage +
+                    Race + 
+                    Rural.Urban.Continuum.Code
+                  , 
+                  data = seer_crc_cleaned_2_complete, 
+                  family = "binomial")
+
+# Step 2: Attach predicted propensity scores to this filtered dataset
+seer_crc_cleaned_2_complete$pscore <- predict(ps_model_2, type = "response")
+
+# Step 3: Plot Before Matching
+ggplot(seer_crc_cleaned_2_complete, aes(x = pscore, fill = as.factor(binary_group_2))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions Before Matching for Group 2", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_before_2.png", width = 8, height = 6, dpi = 300)
+
+# Step 4: Perform Matching
+seer_crc_cleaned_2_complete$logit_pscore <- log(seer_crc_cleaned_2_complete$pscore / (1 - seer_crc_cleaned_2_complete$pscore))
+
+match_2 <- matchit(
+  binary_group_2 ~ 1,
+  data = seer_crc_cleaned_2_complete,
+  method = "nearest",
+  distance = seer_crc_cleaned_2_complete$logit_pscore,
+  caliper = 0.25,  # on logit scale
+  ratio = 2,
+  replace = FALSE
+)
+
+# match_2 <- matchit(binary_group_2 ~ 1, 
+#                    data = seer_crc_cleaned_2_complete, 
+#                    method = "nearest", 
+#                    distance = seer_crc_cleaned_2_complete$pscore, 
+#                    ratio = 2, 
+#                    caliper = 0.25, 
+#                    replace = FALSE)
+
+# Step 5: Extract Matched Data
+matched_data_2 <- match.data(match_2)
+
+# Step 6: Plot After Matching
+ggplot(matched_data_2, aes(x = pscore, fill = as.factor(binary_group_2))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions After Matching for Group 2", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_after_2.png", width = 8, height = 6, dpi = 300)
+
+# Step 7: Covariate Balance Plot
+plot_2 <- love.plot(match_2, 
+                    binary = "raw", 
+                    threshold = 0.1, 
+                    title = "Covariate Balance: Absolute Standardized Mean Differences for Group 1") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Covariates", y = "Absolute Standardized Mean Difference")
+
+print(plot_2)
+# ggsave("stats_results/loveplot_2.png", width = 16, height = 4, dpi = 300)
+
+
+# Step 8: Show Table of Balance
+bal.tab(match_2)
+
+
+# Step 5: Perform Matching with all covariates in the model
+match_2 <- matchit(
+  binary_group_2 ~ age_category + Combined.Stage +
+    Race +  Rural.Urban.Continuum.Code,  # Include all covariates used in the model
+  data = seer_crc_cleaned_2_complete,
+  method = "nearest",
+  distance = seer_crc_cleaned_2_complete$logit_pscore,
+  caliper = 0.25,  # On logit scale
+  ratio = 2,
+  replace = FALSE
+)
+
+# Step 6: Extract Matched Data
+matched_data_2 <- match.data(match_2)
+
+# Step 7: Plot Propensity Score Distributions After Matching
+ggplot(matched_data_2, aes(x = pscore, fill = as.factor(binary_group_2))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions After Matching for Group 2", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_after_2.png", width = 8, height = 6, dpi = 300)
+
+# Step 8: Covariate Balance Plot
+plot_2 <- love.plot(match_2, 
+                    binary = "raw", 
+                    threshold = 0.1,  # Set threshold for standardized mean differences
+                    title = "Covariate Balance: Absolute Standardized Mean Differences for Group 2") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Covariates", y = "Absolute Standardized Mean Difference")
+
+#Print the love plot
+print(plot_2)
+# ggsave("stats_results/full_loveplot_2.png", width = 16, height = 4, dpi = 300)
+
+# Step 8: Show Table of Balance
+bal.tab(match_2)
+
+
+
+# Group 3 vs 0
+# Step 0: Filter data to complete cases for modeling
+seer_crc_cleaned_3_complete <- seer_crc_cleaned_3[complete.cases(
+  seer_crc_cleaned_3[, c("age_category",  
+                             "Race",
+                             "RX.Summ..Systemic.Sur.Seq..2007..", "stage_group", "surgery_status", 
+                             "income_quintile", "Rural.Urban.Continuum.Code", 
+                             "Marital_Grouped")]), ]
+
+# Step 1: Fit Propensity Score Model
+ps_model_3 <- glm(binary_group_3 ~ age_category + Combined.Stage +
+                    Race + 
+                    Rural.Urban.Continuum.Code
+                  , 
+                  data = seer_crc_cleaned_3_complete, 
+                  family = "binomial")
+
+# Step 2: Attach predicted propensity scores to this filtered dataset
+seer_crc_cleaned_3_complete$pscore <- predict(ps_model_3, type = "response")
+
+# Step 3: Plot Before Matching
+ggplot(seer_crc_cleaned_3_complete, aes(x = pscore, fill = as.factor(binary_group_3))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions Before Matching for Group 3", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_before_3.png", width = 8, height = 6, dpi = 300)
+
+# Step 4: Perform Matching
+seer_crc_cleaned_3_complete$logit_pscore <- log(seer_crc_cleaned_3_complete$pscore / (1 - seer_crc_cleaned_3_complete$pscore))
+
+match_3 <- matchit(
+  binary_group_3 ~ 1,
+  data = seer_crc_cleaned_3_complete,
+  method = "nearest",
+  distance = seer_crc_cleaned_3_complete$logit_pscore,
+  caliper = 0.25,  # on logit scale
+  ratio = 2,
+  replace = FALSE
+)
+# 
+# 
+# match_3 <- matchit(binary_group_3 ~ 1, 
+#                    data = seer_crc_cleaned_3_complete, 
+#                    method = "nearest", 
+#                    distance = seer_crc_cleaned_3_complete$pscore, 
+#                    ratio = 2, 
+#                    caliper = 0.25, 
+#                    replace = FALSE)
+
+# Step 5: Extract Matched Data
+matched_data_3 <- match.data(match_3)
+
+# Step 6: Plot After Matching
+ggplot(matched_data_3, aes(x = pscore, fill = as.factor(binary_group_3))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions After Matching for Group 3", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal() + theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_after_3.png", width = 8, height = 6, dpi = 300)
+
+# Step 7: Covariate Balance Plot
+plot_3 <- love.plot(match_3, 
+                    binary = "raw", 
+                    threshold = 0.1, 
+                    title = "Covariate Balance: Absolute Standardized Mean Differences for Group 1") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Covariates", y = "Absolute Standardized Mean Difference")
+
+print(plot_3)
+
+# ggsave("stats_results/loveplot_3.png", width = 16, height = 4, dpi = 300)
+
+
+# Step 8: Show Table of Balance
+bal.tab(match_3)
+
+
+# Step 5: Perform Matching with all covariates in the model
+match_3 <- matchit(
+  binary_group_3 ~ age_category + Combined.Stage +
+    Race + Rural.Urban.Continuum.Code,  # Include all covariates used in the model
+  data = seer_crc_cleaned_3_complete,
+  method = "nearest",
+  distance = seer_crc_cleaned_3_complete$logit_pscore,
+  caliper = 0.25,  # On logit scale
+  ratio = 2,
+  replace = FALSE
+)
+
+# Step 6: Extract Matched Data
+matched_data_3 <- match.data(match_3)
+
+# Step 7: Plot Propensity Score Distributions After Matching
+ggplot(matched_data_3, aes(x = pscore, fill = as.factor(binary_group_3))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Distributions After Matching for Group 3", 
+       x = "Propensity Score", y = "Density") +
+  theme_minimal()+ theme(text = element_text(family = "Times"))
+# ggsave("stats_results/propensity_scores_after_3.png", width = 8, height = 6, dpi = 300)
+
+# Step 8: Covariate Balance Plot
+plot_3 <- love.plot(match_3, 
+                    binary = "raw", 
+                    threshold = 0.1,  # Set threshold for standardized mean differences
+                    title = "Covariate Balance: Absolute Standardized Mean Differences for Group ") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Covariates", y = "Absolute Standardized Mean Difference")
+
+#Print the love plot
+print(plot_3)
+# # ggsave("stats_results/full_loveplot_3.png", width = 16, height = 4, dpi = 300)
+
+# Step 8: Show Table of Balance
+bal.tab(match_3)
+
+
+bal.tab(match_1)  # For Group 1 vs 0
+bal.tab(match_2)  # For Group 2 vs 0
+bal.tab(match_3)  # For Group 3 vs 0
+
+
+## 5. PSM DiD Survival for all patients with CRC
+
+# start with Frequentist DiD model split by post-implementation era
+
+
+matched_X_data_1 <- matched_data_1
+matched_X_data_2 <- matched_data_2
+matched_X_data_3 <- matched_data_3
+
+# overall (not inclusive of expansion status) does not include Status + dx.yr_grouped
+cleaned_crc_1$capped_time <- pmin(cleaned_crc_1$Survival.months, 36)
+cleaned_crc_1$capped_event <- ifelse(cleaned_crc_1$Survival.months > 36, 0, cleaned_crc_1$Event)
+cleaned_crc_1 <- cleaned_crc_1 %>%
+  filter(!grepl("Unknown Race", trimws(Race)))
+
+#Combine previous 3 Matched Data tables into 1 group
+# Combine the matched datasets and add a group identifier
+matched_X_data_1$group <- "Group 1"
+matched_X_data_2$group <- "Group 2"
+matched_X_data_3$group <- "Group 3"
+
+# Combine all matched datasets into one
+combined_matched_data <- bind_rows(matched_X_data_1, matched_X_data_2, matched_X_data_3)
+
+# Check the structure of the combined data
+str(combined_matched_data)
+
+combined_matched_data$capped_time <- pmin(combined_matched_data$Survival.months, 36)
+combined_matched_data$capped_event <- ifelse(combined_matched_data$Survival.months > 36, 0, combined_matched_data$Event)
+combined_matched_data <- combined_matched_data[combined_matched_data$capped_time > 0, ]
+
+
+cox_psm_final <- coxph(
+  Surv(capped_time, capped_event) ~ age_category + Marital_Grouped  +
+    Rural.Urban.Continuum.Code + Race + income_quintile + surgery_status + RX.Summ..Systemic.Sur.Seq..2007..,
+  data = combined_matched_data,
+  cluster = combined_matched_data$Medicaid.Expansion.Status,
+  robust = TRUE
+)
+
+capped_fin_cox_psm_final_sum <- tidy(cox_psm_final, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+View(capped_fin_cox_psm_final_sum)
+
+write.csv(capped_fin_cox_psm_final_sum, "coxdata/psm_covariates.csv")
+
+seer_crc$income_quintile <- relevel(seer_crc$income_quintile, ref = "3")
+seer_crc$Marital_Grouped <- relevel(seer_crc$Marital_Grouped, ref = "Single/Unknown")
+
+cox_all_final <- coxph(
+  Surv(capped_time, capped_event) ~ age_category + Marital_Grouped  + Sex +
+    Rural.Urban.Continuum.Code + Race + income_quintile + surgery_status + stage_group,
+  data = seer_crc,
+  cluster = seer_crc$Medicaid.Expansion.Status,
+  robust = TRUE
+)
+
+capped_fin_cox_all_final_sum <- tidy(cox_all_final, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+View(capped_fin_cox_all_final_sum)
+
+write.csv(capped_fin_cox_all_final_sum, "coxdata/all_covariates.csv")
+
+
+
+table(matched_data_1$Medicaid.Expansion.Status)
+
+# Group by Group Difference in Differences analysis
+# 0 vs 1
+# Create expansion1_time variable (Pre = 2006-2010, Post = 2011-2019)
+matched_X_data_1 <- matched_X_data_1 %>%
+  mutate(expansion1_time = case_when(
+    dx.yr_grouped %in% c("2006-2010") ~ "Pre",
+    dx.yr_grouped %in% c("2011-2013", "2014-2016", "2017-2019") ~ "Post",
+    TRUE ~ NA_character_  # Assign NA for years outside the study period
+  ))
+
+# Create expansion1_group variable (1 = expansion1 states, 0 = non-expansion states)
+matched_X_data_1 <- matched_X_data_1 %>%
+  mutate(expansion1_group = case_when(
+    Medicaid_Expansion_Status == 1 ~ 1,  # Expansion 1 (early)
+    Medicaid_Expansion_Status == 0 ~ 0,  # Non-expansion (control)
+    TRUE ~ NA_real_  # Assign NA for other groups
+  ))
+
+# Subset to only include subjects from Expansion Group 0 and 1
+matched_X_data_1 <- matched_X_data_1 %>%
+  filter(Medicaid_Expansion_Status %in% c(0, 1)) %>%
+  # Create a binary treatment variable:
+  # did_treat = 1 if Expansion Group 1, 0 if Expansion Group 0
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 1, 1, 0),
+         did_time = ifelse(dx.yr_grouped == "2006-2010", "Pre", "Post"))
+
+# Convert did_time and did_treat to factors with explicit ordering:
+matched_X_data_1 <- matched_X_data_1 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+matched_X_data_1$capped_time <- pmin(matched_X_data_1$Survival.months, 36)
+matched_X_data_1$capped_event <- ifelse(matched_X_data_1$Survival.months > 36, 0, matched_X_data_1$Event)
+
+
+
+capped_fin_cox_psm_final_did_1 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                        data = matched_X_data_1, robust = TRUE)
+
+
+summary(capped_fin_cox_psm_final_did_1)
+
+capped_fin_cox_psm_final_did_1 <- tidy(capped_fin_cox_psm_final_did_1, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+ 
+View(capped_fin_cox_psm_final_did_1)
+
+write.csv(capped_fin_cox_psm_final_did_1, "coxdata/psm_0v1.csv")
+
+
+
+# EARLY - consider early months (post-implementation periods)
+# Step 1: Subset data to focus on 2014-2019
+matched_X_data_1_did_early_1 <- matched_X_data_1 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2011-2013"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_1_did_early_1 <- matched_X_data_1_did_early_1 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2011-2013"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_1_did_early_1 <- matched_X_data_1_did_early_1 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 1, 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_1_did_early_1 <- matched_X_data_1_did_early_1 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_1_did_early_1$did_time)
+contrasts(matched_X_data_1_did_early_1$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_early_1 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat+ cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_1_did_early_1, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_early_1)
+
+capped_fin_cox_psm_final_did_early_1 <- tidy(capped_fin_cox_psm_final_early_1, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+View(capped_fin_cox_psm_final_did_early_1)
+
+write.csv(capped_fin_cox_psm_final_did_early_1, "coxdata/psm_0v1_early.csv")
+
+
+# LATER
+# Step 1: Subset data to focus on 2014-2019
+matched_X_data_1_did_later_1 <- matched_X_data_1 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2014-2016", "2017-2019"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_1_did_later_1 <- matched_X_data_1_did_later_1 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2014-2016", "2017-2019"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_1_did_later_1 <- matched_X_data_1_did_later_1 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 1, 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_1_did_later_1 <- matched_X_data_1_did_later_1 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_1_did_later_1$did_time)
+contrasts(matched_X_data_1_did_later_1$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_later_1 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_1_did_later_1, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_later_1)
+
+capped_fin_cox_psm_final_did_later_1 <- tidy(capped_fin_cox_psm_final_later_1, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+View(capped_fin_cox_psm_final_did_later_1)
+
+write.csv(capped_fin_cox_psm_final_did_later_1, "coxdata/psm_0v1_later.csv")
+
+### LAST ####
+
+# Step 1: Subset data to focus on 2014-2019
+matched_X_data_1_did_last_1 <- matched_X_data_1 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2017-2019"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_1_did_last_1 <- matched_X_data_1_did_last_1 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2017-2019"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_1_did_last_1 <- matched_X_data_1_did_last_1 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 1, 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_1_did_last_1 <- matched_X_data_1_did_last_1 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_1_did_last_1$did_time)
+
+contrasts(matched_X_data_1_did_last_1$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_later_1 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_1_did_last_1, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_later_1)
+
+capped_fin_cox_psm_final_did_last_1 <- tidy(capped_fin_cox_psm_final_later_1, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+# View(capped_fin_cox_psm_final_did_last_1)
+
+write.csv(capped_fin_cox_psm_final_did_last_1, "coxdata/psm_0v1_LAST.csv")
+
+
+#### Mid Group ####
+
+# Step 1: Subset data to focus on 2014-2019
+matched_X_data_1_did_mid_1 <- matched_X_data_1 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2014-2016"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_1_did_mid_1 <- matched_X_data_1_did_mid_1 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2014-2016"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_1_did_mid_1 <- matched_X_data_1_did_mid_1 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == "Early Expansion", 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_1_did_mid_1 <- matched_X_data_1_did_mid_1 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_1_did_mid_1$did_time)
+contrasts(matched_X_data_1_did_mid_1$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_later_1 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_1_did_mid_1, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_later_1)
+
+capped_fin_cox_psm_final_did_mid_1 <- tidy(capped_fin_cox_psm_final_later_1, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+# View(capped_fin_cox_psm_final_did_mid_1)
+
+write.csv(capped_fin_cox_psm_final_did_mid_1, "coxdata/psm_0v1_MID.csv")
+
+
+
+##### LATE + MID #
+# Step 1: Subset data to focus on 2011-2016
+matched_X_data_1_did_early_mid_1 <- matched_X_data_1 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2011-2013", "2014-2016"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_1_did_early_mid_1 <- matched_X_data_1_did_early_mid_1 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2011-2013", "2014-2016"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_1_did_early_mid_1 <- matched_X_data_1_did_early_mid_1 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 1, 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_1_did_early_mid_1 <- matched_X_data_1_did_early_mid_1 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_1_did_early_mid_1$did_time)
+contrasts(matched_X_data_1_did_early_mid_1$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_later_1 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_1_did_early_mid_1, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_later_1)
+
+capped_fin_cox_psm_final_did_early_mid_1 <- tidy(capped_fin_cox_psm_final_later_1, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+# # # # View(capped_fin_cox_psm_final_did_early_mid_1)
+
+write.csv(capped_fin_cox_psm_final_did_early_mid_1, "coxdata/psm_0v1_2011-2016.csv")
+
+
+saveRDS(matched_X_data_1, file = "bayesian/inputs/matched_X_data_1.rds")
+
+saveRDS(matched_X_data_1_did_early_1, file = "bayesian/inputs/matched_X_data_1_did_early_1.rds")
+
+saveRDS(matched_X_data_1_did_later_1, file = "bayesian/inputs/matched_X_data_1_did_later_1.rds")
+
+
+##### GROUP 2 ####
+matched_X_data_2 <- matched_data_2
+# Group by Group Difference in Differences analysis
+# 0 vs 2
+# Create expansion2_time variable (Pre = 2006-2010, Post = 2011-2019)
+matched_X_data_2 <- matched_X_data_2 %>%
+  mutate(expansion2_time = case_when(
+    dx.yr_grouped %in% c("2006-2010", "2011-2013") ~ "Pre",
+    dx.yr_grouped %in% c("2014-2016", "2017-2019") ~ "Post",
+    TRUE ~ NA_character_  # Assign NA for years outside the study period
+  ))
+
+# Create expansion1_group variable ( = expansion1 states, 0 = non-expansion states)
+matched_X_data_2 <- matched_X_data_2 %>%
+  mutate(expansion1_group = case_when(
+    Medicaid_Expansion_Status == 2 ~ 1,  # Expansion 1 (early)
+    Medicaid_Expansion_Status == 0 ~ 0,  # Non-expansion (control)
+    TRUE ~ NA_real_  # Assign NA for other groups
+  ))
+
+# Subset to only include subjects from Expansion Group 0 and 1
+matched_X_data_2 <- matched_X_data_2 %>%
+  filter(Medicaid_Expansion_Status %in% c(0, 2)) %>%
+  mutate(
+    did_treat = ifelse(Medicaid_Expansion_Status == 2, 1, 0),
+    did_time = ifelse(dx.yr_grouped %in% c("2006-2010", "2011-2013"), "Pre", "Post")
+  )
+
+# Convert did_time and did_treat to factors with explicit ordering:
+matched_X_data_2 <- matched_X_data_2 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+matched_X_data_2$capped_time <- pmin(matched_X_data_2$Survival.months, 36)
+
+matched_X_data_2$capped_event <- ifelse(matched_X_data_2$Survival.months > 36, 0, matched_X_data_2$Event)
+
+
+
+capped_fin_cox_psm_final_did_2 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                        data = matched_X_data_2, robust = TRUE)
+
+
+summary(capped_fin_cox_psm_final_did_2)
+
+capped_fin_cox_psm_final_did_2 <- tidy(capped_fin_cox_psm_final_did_2, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+ View(capped_fin_cox_psm_final_did_2)
+
+write.csv(capped_fin_cox_psm_final_did_2, "coxdata/psm_0v2.csv")
+
+
+
+# EARLY - consider early months (post-implementation periods)
+# Step 1: Subset data to focus on 2014-2019
+matched_X_data_2_did_early_2 <- matched_X_data_2 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2011-2013", "2014-2016"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_2_did_early_2 <- matched_X_data_2_did_early_2 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2014-2016"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_2_did_early_2 <- matched_X_data_2_did_early_2 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 2, 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_2_did_early_2 <- matched_X_data_2_did_early_2 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_2_did_early_2$did_time)
+contrasts(matched_X_data_2_did_early_2$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_early_2 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat+ cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_2_did_early_2, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_early_2)
+
+capped_fin_cox_psm_final_did_early_2 <- tidy(capped_fin_cox_psm_final_early_2, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+View(capped_fin_cox_psm_final_did_early_2)
+
+write.csv(capped_fin_cox_psm_final_did_early_2, "coxdata/psm_0v2_early.csv")
+
+
+# LATER
+# Step 1: Subset data to focus on 2014-2019
+matched_X_data_2_did_later_2 <- matched_X_data_2 %>%
+  filter(dx.yr_grouped %in% c("2006-2010", "2011-2013", "2017-2019"))
+
+# Step 2: Update the time variable for 2014-2016 and 2017-2019 periods
+matched_X_data_2_did_later_2 <- matched_X_data_2_did_later_2 %>%
+  mutate(did_time = ifelse(dx.yr_grouped %in% c("2017-2019"), "Post", "Pre"))
+
+# Create treatment variable (same as before)
+matched_X_data_2_did_later_2 <- matched_X_data_2_did_later_2 %>%
+  mutate(did_treat = ifelse(Medicaid_Expansion_Status == 2, 1, 0))
+
+# Step 3: Ensure 'did_time' is a factor with 'Pre' as reference
+matched_X_data_2_did_later_2 <- matched_X_data_2_did_later_2 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+    
+  )
+
+# Check reference levels
+contrasts(matched_X_data_2_did_later_2$did_time)
+contrasts(matched_X_data_2_did_later_2$did_treat)
+
+# Step 4: Run Cox regression model
+capped_fin_cox_psm_final_later_2 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                          data = matched_X_data_2_did_later_2, robust = TRUE)
+
+# Step 5: Summary of the model
+summary(capped_fin_cox_psm_final_later_2)
+
+capped_fin_cox_psm_final_did_later_2 <- tidy(capped_fin_cox_psm_final_later_2, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+print(capped_fin_cox_psm_final_did_later_2)
+
+write.csv(capped_fin_cox_psm_final_did_later_2, "coxdata/psm_0v2_later.csv")
+
+
+### GROUP 3 ####
+
+matched_X_data_3 <- matched_data_3
+# Group by Group Difference in Differences analysis
+# 0 vs 3
+# Create expansion2_time variable (Pre = 2006-2010, Post = 2011-2019)
+matched_X_data_3 <- matched_X_data_3 %>%
+  mutate(expansion3_time = case_when(
+    dx.yr_grouped %in% c("2006-2010", "2011-2013", "2014-2016") ~ "Pre",
+    dx.yr_grouped %in% c("2017-2019") ~ "Post",
+    TRUE ~ NA_character_  # Assign NA for years outside the study period
+  ))
+
+# Create expansion1_group variable ( = expansion1 states, 0 = non-expansion states)
+matched_X_data_3 <- matched_X_data_3 %>%
+  mutate(expansion1_group = case_when(
+    Medicaid_Expansion_Status == 3 ~ 1,  # Expansion 1 (early)
+    Medicaid_Expansion_Status == 0 ~ 0,  # Non-expansion (control)
+    TRUE ~ NA_real_  # Assign NA for other groups
+  ))
+
+# Subset to only include subjects from Expansion Group 0 and 1
+matched_X_data_3 <- matched_X_data_3 %>%
+  filter(Medicaid_Expansion_Status %in% c(0, 3)) %>%
+  mutate(
+    did_treat = ifelse(Medicaid_Expansion_Status == 3, 1, 0),
+    did_time = ifelse(dx.yr_grouped %in% c("2006-2010", "2011-2013", "2014-2016"), "Pre", "Post")
+  )
+
+# Convert did_time and did_treat to factors with explicit ordering:
+matched_X_data_3 <- matched_X_data_3 %>%
+  mutate(
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+matched_X_data_3$capped_time <- pmin(matched_X_data_3$Survival.months, 36)
+
+matched_X_data_3$capped_event <- ifelse(matched_X_data_3$Survival.months > 36, 0, matched_X_data_3$Event)
+
+
+
+capped_fin_cox_psm_final_did_3 <- coxph(Surv(capped_time, capped_event) ~ did_time * did_treat + cluster(Medicaid.Expansion.Status),
+                                        data = matched_X_data_3, robust = TRUE)
+
+
+summary(capped_fin_cox_psm_final_did_3)
+
+capped_fin_cox_psm_final_did_3 <- tidy(capped_fin_cox_psm_final_did_3, conf.int = TRUE) %>%
+  mutate(HR = exp(estimate),  # Convert coefficients to hazard ratios
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) %>%
+  dplyr::select(term, HR, CI_lower, CI_upper, p.value)
+
+
+
+print(capped_fin_cox_psm_final_did_3)
+
+write.csv(capped_fin_cox_psm_final_did_3, "coxdata/psm_0v3.csv")
+
+# save as RDS file for Bayesian model
+saveRDS(matched_X_data_2, file = "bayesian/inputs/matched_X_data_2.rds")
+
+saveRDS(matched_X_data_2_did_early_2, file = "bayesian/inputs/matched_X_data_2_did_early_2.rds")
+
+saveRDS(matched_X_data_2_did_later_2, file = "bayesian/inputs/matched_X_data_2_did_later_2.rds")
+
+
+saveRDS(matched_X_data_3, file = "bayesian/inputs/matched_X_data_3.rds")
+
+
+## 6. Bayesian Regression for survival
+seer_crc_did_psm_1 <- readRDS("bayesian/inputs/matched_X_data_1.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.15)", class = "b", coef = "did_timePost:did_treat1") 
+  set_prior("normal(0.1, 0.1)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+
+# Define the model formula with covariates
+did_brm_psm_1 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    #  age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #  Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+# Fit the model
+did_brm_model_1 <- brm(
+  formula = did_brm_psm_1,
+  data = seer_crc_did_psm_1,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_1, file = "bayesian/out/did_brm_psm_1.rds")
+
+did_brm_psm_1 <- readRDS("bayesian/out/did_brm_psm_1.rds")
+
+
+
+# Validation:
+sum_1 = summary(did_brm_psm_1)
+plot_1 = plot(did_brm_psm_1)  # trace and density plots
+
+pp_1a = pp_check(did_brm_psm_1)  # posterior predictive checks
+pp_1b = pp_check(did_brm_psm_1, type = "stat")
+pp_1c = pp_check(did_brm_psm_1, type = "stat_grouped", group = "did_treat")
+
+loo_1 = loo(did_brm_psm_1)  # Leave-One-Out Cross Validation
+waic_1 = waic(did_brm_psm_1)  # Widely Applicable Information 
+
+
+# Combine LOO and WAIC results
+bayes_validation_df <- rbind(loo_1, waic_1)
+
+# Save to CSV
+write.csv(bayes_validation_df, "bayes_output/bayesian_model_validation_summary_1.csv", row.names = FALSE)
+
+
+pairs_1 = pairs(did_brm_psm_1) 
+
+postsamp_1 = posterior_samples(did_brm_psm_1)
+
+
+
+# Validation
+
+# 1. Summary (Save as text)
+sum_1 <- summary(did_brm_model_1)
+sink("bayes_output/summary_1.txt")
+print(sum_1)
+sink()
+
+# 2. Trace & Density Plots
+png("bayes_output/trace_density_1.png", width = 1200, height = 800)
+plot(did_brm_model_1)
+dev.off()
+
+# 3. Posterior Predictive Checks
+ggsave("bayes_output/pp_check_overlay_1.png", pp_check(did_brm_model_1), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_1.png", pp_check(did_brm_model_1, type = "stat"), width = 8, height = 6, dpi = 300)
+# pp_check(did_brm_model_1, type = "stat_grouped", group = "did_treat1")
+# pp_check(did_brm_model_1, type = "dens_overlay")
+ggsave("bayes_output/pp_check_stat_grouped_1.png", pp_check(did_brm_model_1, type = "stat_grouped", group = "did_treat"), width = 8, height = 6, dpi = 300)
+
+# 4. LOO & WAIC (Full + summary)
+# loo_1 <- loo(did_brm_model_1) # too big... 
+waic_1 <- waic(did_brm_model_1)
+bayes_validation_df <- waic_1
+
+# Save full object — large file!
+saveRDS(bayes_validation_df, file = "bayes_output/full_validation_object_1.rds")
+
+validation_summary <- data.frame(
+  Method = c("LOO", "WAIC"),
+  Est = c(loo_1$estimates["elpd_loo", "Estimate"], waic_1$estimates["elpd_waic", "Estimate"]),
+  SE = c(loo_1$estimates["elpd_loo", "SE"], waic_1$estimates["elpd_waic", "SE"]),
+  p_eff = c(loo_1$estimates["p_loo", "Estimate"], waic_1$estimates["p_waic", "Estimate"])
+)
+write.csv(validation_summary, "bayes_output/validation_summary_1.csv", row.names = FALSE)
+
+# 5. Posterior samples — optional to save
+postsamp_1 <- posterior_samples(did_brm_model_1)
+saveRDS(postsamp_1, "bayes_output/posterior_samples_1.rds")
+
+# 6. Pairs Plot — for supplement if needed
+png("bayes_output/pairs_plot_1.png", width = 1000, height = 1000)
+pairs(did_brm_model_1)
+dev.off()
+
+
+
+fixef(did_brm_psm_1) 
+
+conditional_effects(did_brm_psm_1, effects = "did_time:did_treat")
+
+fixed_effects_1 <- as.data.frame(fixef(did_brm_psm_1))
+
+# Add term names as a column
+fixed_effects_1 <- fixed_effects_1 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_1 <- as_draws_df(did_brm_psm_1)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_1$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_1 <- fixed_effects_1 %>%
+  mutate(prob_neg = mean(posterior_draws_1$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_1 <- fixed_effects_1 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_1 = mean(posterior_draws_1$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_1 <- fixed_effects_1 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_1 = 1 - prob_HR_less_1  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_1)
+
+# Save as CSV
+write.csv(fixed_effects_1, "bayes_nocovar/brm_fixed_effects_results_1.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_1, "bayes_nocovar/brm_fixed_effects_results_1.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+
+
+library(brms)
+
+
+### BAYESIAN MODEL 0v2 #### NO COVARIATES
+seer_crc_did_psm_2 <- readRDS("bayesian/inputs/matched_X_data_2.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.2)", class = "b", coef = "did_timePost:did_treat1") 
+  set_prior("normal(0.15, 0.075)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+# Define the model formula with covariates
+did_brm_psm_2 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    # age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #  Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+
+# Fit the model
+did_brm_model_2 <- brm(
+  formula = did_brm_psm_2,
+  data = seer_crc_did_psm_2,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_2, file = "bayesian/out/did_brm_psm_2.rds")
+
+did_brm_psm_2 <- readRDS("bayesian/out/did_brm_psm_2.rds")
+
+
+### Paper-Ready Validation ###
+
+# 1. Summary (Save as text)
+sum_2 <- summary(did_brm_model_2)
+sink("bayes_output/summary_2.txt")
+print(sum_2)
+sink()
+
+# 2. Trace & Density Plots
+png("bayes_output/trace_density_2.png", width = 1200, height = 800)
+plot(did_brm_model_2)
+dev.off()
+
+# 3. Posterior Predictive Checks
+ggsave("bayes_output/pp_check_overlay_2.png", pp_check(did_brm_model_2), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_2.png", pp_check(did_brm_model_2, type = "stat"), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_grouped_2.png", pp_check(did_brm_model_2, type = "stat_grouped", group = "did_treat"), width = 8, height = 6, dpi = 300)
+
+# 4. LOO & WAIC (Full + summary)
+loo_2 <- loo(did_brm_model_2)
+waic_2 <- waic(did_brm_model_2)
+bayes_validation_df <- rbind(loo_2, waic_2)
+
+# Save full object — large file!
+saveRDS(bayes_validation_df, file = "bayes_output/full_validation_object_2.rds")
+
+# Also export a trimmed summary version (for supplement)
+validation_summary <- data.frame(
+  Method = c("LOO", "WAIC"),
+  Est = c(loo_2$estimates["elpd_loo", "Estimate"], waic_2$estimates["elpd_waic", "Estimate"]),
+  SE = c(loo_2$estimates["elpd_loo", "SE"], waic_2$estimates["elpd_waic", "SE"]),
+  p_eff = c(loo_2$estimates["p_loo", "Estimate"], waic_2$estimates["p_waic", "Estimate"])
+)
+write.csv(validation_summary, "bayes_output/validation_summary_2.csv", row.names = FALSE)
+
+# 5. Posterior samples — optional to save
+postsamp_2 <- posterior_samples(did_brm_model_2)
+saveRDS(postsamp_2, "bayes_output/posterior_samples_2.rds")
+
+# 6. Pairs Plot — for supplement if needed
+png("bayes_output/pairs_plot_2.png", width = 1000, height = 1000)
+pairs(did_brm_model_2)
+dev.off()
+
+
+
+fixef(did_brm_psm_2) 
+
+conditional_effects(did_brm_psm_2, effects = "did_time:did_treat")
+
+fixed_effects_2 <- as.data.frame(fixef(did_brm_psm_2))
+
+# Add term names as a column
+fixed_effects_2 <- fixed_effects_2 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_2 <- as_draws_df(did_brm_psm_2)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_2$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_2 <- fixed_effects_2 %>%
+  mutate(prob_neg = mean(posterior_draws_2$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_2 <- fixed_effects_2 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_2 = mean(posterior_draws_2$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_2 <- fixed_effects_2 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_2 = 1 - prob_HR_less_2  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_2)
+
+
+
+# Save as CSV
+write.csv(fixed_effects_2, "bayes_nocovar/brm_fixed_effects_results_2.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_2, "bayes_nocovar/brm_fixed_effects_results_2.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+
+
+
+### BAYESIAN MODEL 0v3 ####
+seer_crc_did_psm_3 <- readRDS("bayesian/inputs/matched_X_data_3.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.2)", class = "b", coef = "did_timePost:did_treat1") 
+  # set_prior("normal(0.1, 0.1)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  set_prior("normal(0.1, 0.075)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+# Define the model formula with covariates
+did_brm_psm_3 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    #   age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #   Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+
+# Fit the model
+did_brm_model_3 <- brm(
+  formula = did_brm_psm_3,
+  data = seer_crc_did_psm_3,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.999, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_3, file = "bayesian/out/did_brm_psm_3.rds")
+
+did_brm_psm_3 <- readRDS("bayesian/out/did_brm_psm_3.rds")
+
+
+
+
+### Paper-Ready Validation ###
+
+# 1. Summary (Save as text)
+sum_3 <- summary(did_brm_model_3)
+sink("bayes_output/summary_3.txt")
+print(sum_3)
+sink()
+
+# 2. Trace & Density Plots
+png("bayes_output/trace_density_3.png", width = 1200, height = 800)
+plot(did_brm_model_3)
+dev.off()
+
+# 3. Posterior Predictive Checks
+ggsave("bayes_output/pp_check_overlay_3.png", pp_check(did_brm_model_3), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_3.png", pp_check(did_brm_model_3, type = "stat"), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_grouped_3.png", pp_check(did_brm_model_3, type = "stat_grouped", group = "did_treat"), width = 8, height = 6, dpi = 300)
+
+# 4. LOO & WAIC (Full + summary)
+loo_3 <- loo(did_brm_model_3)
+waic_3 <- waic(did_brm_model_3)
+bayes_validation_df <- rbind(loo_3, waic_3)
+
+# Save full object — large file!
+saveRDS(bayes_validation_df, file = "bayes_output/full_validation_object_3.rds")
+
+# Also export a trimmed summary version (for supplement)
+validation_summary <- data.frame(
+  Method = c("LOO", "WAIC"),
+  Est = c(loo_3$estimates["elpd_loo", "Estimate"], waic_3$estimates["elpd_waic", "Estimate"]),
+  SE = c(loo_3$estimates["elpd_loo", "SE"], waic_3$estimates["elpd_waic", "SE"]),
+  p_eff = c(loo_3$estimates["p_loo", "Estimate"], waic_3$estimates["p_waic", "Estimate"])
+)
+write.csv(validation_summary, "bayes_output/validation_summary_3.csv", row.names = FALSE)
+
+# 5. Posterior samples — optional to save
+postsamp_3 <- posterior_samples(did_brm_model_3)
+saveRDS(postsamp_3, "bayes_output/posterior_samples_3.rds")
+
+# 6. Pairs Plot — for supplement if needed
+png("bayes_output/pairs_plot_3.png", width = 1000, height = 1000)
+pairs(did_brm_model_3)
+dev.off()
+
+
+
+fixef(did_brm_psm_3) 
+
+conditional_effects(did_brm_psm_3, effects = "did_time:did_treat")
+
+fixed_effects_3 <- as.data.frame(fixef(did_brm_psm_3))
+
+# Add term names as a column
+fixed_effects_3 <- fixed_effects_3 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_3 <- as_draws_df(did_brm_psm_3)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_3$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_3 <- fixed_effects_3 %>%
+  mutate(prob_neg = mean(posterior_draws_3$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_3 <- fixed_effects_3 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_3 = mean(posterior_draws_3$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_3 <- fixed_effects_3 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_3 = 1 - prob_HR_less_3  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_3)
+
+# Save as CSV
+write.csv(fixed_effects_3, "bayes_nocovar/brm_fixed_effects_results_3.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_3, "bayes_nocovar/brm_fixed_effects_results_3.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+print(fixed_effects_3)
+
+seer_crc_did_psm_early1 <- readRDS("bayesian/inputs/matched_X_data_1_did_early_1.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.2)", class = "b", coef = "did_timePost:did_treat1") 
+  set_prior("normal(0.1, 0.1)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+# Define the model formula with covariates
+did_brm_psm_early1 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    #  age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #  Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+# Fit the model
+did_brm_model_early1 <- brm(
+  formula = did_brm_psm_early1,
+  data = seer_crc_did_psm_early1,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.995, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_early1, file = "bayesian/out/did_brm_psm_early1.rds")
+
+did_brm_psm_early1 <- readRDS("bayesian/out/did_brm_psm_early1.rds")
+
+
+fixef(did_brm_psm_early1) 
+
+conditional_effects(did_brm_psm_early1, effects = "did_time:did_treat")
+
+fixed_effects_early1 <- as.data.frame(fixef(did_brm_psm_early1))
+
+# Add term names as a column
+fixed_effects_early1 <- fixed_effects_early1 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_early1 <- as_draws_df(did_brm_psm_early1)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_early1$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_early1 <- fixed_effects_early1 %>%
+  mutate(prob_neg = mean(posterior_draws_early1$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_early1 <- fixed_effects_early1 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_early1 = mean(posterior_draws_early1$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_early1 <- fixed_effects_early1 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_early1 = 1 - prob_HR_less_early1  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_early1)
+
+# Save as CSV
+write.csv(fixed_effects_early1, "bayes_nocovar/brm_fixed_effects_results_early1.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_early1, "bayes_nocovar/brm_fixed_effects_results_early1.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+
+
+### Bayesian 0v1 late ###
+
+seer_crc_did_psm_late1 <- readRDS("bayesian/inputs/matched_X_data_1_did_later_1.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.2)", class = "b", coef = "did_timePost:did_treat1") 
+  set_prior("normal(0.1, 0.1)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+# Define the model formula with covariates
+did_brm_psm_late1 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    #  age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #  Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+# Fit the model
+did_brm_model_late1 <- brm(
+  formula = did_brm_psm_late1,
+  data = seer_crc_did_psm_late1,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_late1, file = "bayesian/out/did_brm_psm_late1.rds")
+
+did_brm_psm_late1 <- readRDS("bayesian/out/did_brm_psm_late1.rds")
+
+
+
+# Validation:
+sum_late1 = summary(did_brm_psm_late1)
+plot_late1 = plot(did_brm_psm_late1)  # trace and density plots
+
+pp_late1a = pp_check(did_brm_psm_late1)  # posterior predictive checks
+pp_late1b = pp_check(did_brm_psm_late1, type = "stat")
+pp_late1c = pp_check(did_brm_psm_late1, type = "stat_grouped", group = "did_treat")
+
+loo_late1 = loo(did_brm_psm_late1)  # Leave-One-Out Cross Validation
+waic_late1 = waic(did_brm_psm_late1)  # Widely Applicable Information 
+
+
+# Combine LOO and WAIC results
+bayes_validation_df <- rbind(loo_late1, waic_late1)
+
+# Save to CSV
+write.csv(bayes_validation_df, "bayes_output/bayesian_model_validation_summary_late1.csv", row.names = FALSE)
+
+
+pairs_late1 = pairs(did_brm_psm_late1) 
+
+postsamp_late1 = posterior_samples(did_brm_psm_late1)
+
+
+
+### Paper-Ready Validation ###
+
+# 1. Summary (Save as text)
+sum_late1 <- summary(did_brm_model_late1)
+sink("bayes_output/summary_late1.txt")
+print(sum_late1)
+sink()
+
+# 2. Trace & Density Plots
+png("bayes_output/trace_density_late1.png", width = 1200, height = 800)
+plot(did_brm_model_late1)
+dev.off()
+
+# 3. Posterior Predictive Checks
+ggsave("bayes_output/pp_check_overlay_late1.png", pp_check(did_brm_model_late1), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_late1.png", pp_check(did_brm_model_late1, type = "stat"), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_grouped_late1.png", pp_check(did_brm_model_late1, type = "stat_grouped", group = "did_treat"), width = 8, height = 6, dpi = 300)
+
+# 4. LOO & WAIC (Full + summary)
+loo_late1 <- loo(did_brm_model_late1)
+waic_late1 <- waic(did_brm_model_late1)
+bayes_validation_df <- rbind(loo_late1, waic_late1)
+
+# Save full object — large file!
+saveRDS(bayes_validation_df, file = "bayes_output/full_validation_object_late1.rds")
+
+# Also export a trimmed summary version (for supplement)
+validation_summary <- data.frame(
+  Method = c("LOO", "WAIC"),
+  Est = c(loo_late1$estimates["elpd_loo", "Estimate"], waic_late1$estimates["elpd_waic", "Estimate"]),
+  SE = c(loo_late1$estimates["elpd_loo", "SE"], waic_late1$estimates["elpd_waic", "SE"]),
+  p_eff = c(loo_late1$estimates["p_loo", "Estimate"], waic_late1$estimates["p_waic", "Estimate"])
+)
+write.csv(validation_summary, "bayes_output/validation_summary_late1.csv", row.names = FALSE)
+
+# 5. Posterior samples — optional to save
+postsamp_late1 <- posterior_samples(did_brm_model_late1)
+saveRDS(postsamp_late1, "bayes_output/posterior_samples_late1.rds")
+
+# 6. Pairs Plot — for supplement if needed
+png("bayes_output/pairs_plot_late1.png", width = 1000, height = 1000)
+pairs(did_brm_model_late1)
+dev.off()
+
+
+
+
+fixef(did_brm_psm_late1) 
+
+conditional_effects(did_brm_psm_late1, effects = "did_time:did_treat")
+
+fixed_effects_late1 <- as.data.frame(fixef(did_brm_psm_late1))
+
+# Add term names as a column
+fixed_effects_late1 <- fixed_effects_late1 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_late1 <- as_draws_df(did_brm_psm_late1)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_late1$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_late1 <- fixed_effects_late1 %>%
+  mutate(prob_neg = mean(posterior_draws_late1$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_late1 <- fixed_effects_late1 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_late1 = mean(posterior_draws_late1$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_late1 <- fixed_effects_late1 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_late1 = 1 - prob_HR_less_late1  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_late1)
+
+# Save as CSV
+write.csv(fixed_effects_late1, "bayes_nocovar/brm_fixed_effects_results_late1.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_late1, "bayes_nocovar/brm_fixed_effects_results_late1.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+
+### Bayesian 0v2 early ###
+
+seer_crc_did_psm_early2 <- readRDS("bayesian/inputs/matched_X_data_2_did_early_2.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.2)", class = "b", coef = "did_timePost:did_treat1") 
+  # set_prior("normal(0.1, 0.05)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  set_prior("normal(0.15, 0.075)", class = "b", coef = "did_timePost:did_treat1")
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+
+# Define the model formula with covariates
+did_brm_psm_early2 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    #  age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #  Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+# Fit the model
+did_brm_model_early2 <- brm(
+  formula = did_brm_psm_early2,
+  data = seer_crc_did_psm_early2,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_early2, file = "bayesian/out/did_brm_psm_early2.rds")
+
+did_brm_psm_early2 <- readRDS("bayesian/out/did_brm_psm_early2.rds")
+
+
+### Paper-Ready Validation ###
+
+# 1. Summary (Save as text)
+sum_early2 <- summary(did_brm_model_early2)
+sink("bayes_output/summary_early2.txt")
+print(sum_early2)
+sink()
+
+# 2. Trace & Density Plots
+png("bayes_output/trace_density_early2.png", width = 1200, height = 800)
+plot(did_brm_model_early2)
+dev.off()
+
+# 3. Posterior Predictive Checks
+ggsave("bayes_output/pp_check_overlay_early2.png", pp_check(did_brm_model_early2), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_early2.png", pp_check(did_brm_model_early2, type = "stat"), width = 8, height = 6, dpi = 300)
+ggsave("bayes_output/pp_check_stat_grouped_early2.png", pp_check(did_brm_model_early2, type = "stat_grouped", group = "did_treat"), width = 8, height = 6, dpi = 300)
+
+# 4. LOO & WAIC (Full + summary)
+loo_early2 <- loo(did_brm_model_early2)
+waic_early2 <- waic(did_brm_model_early2)
+bayes_validation_df <- rbind(loo_early2, waic_early2)
+
+# Save full object — large file!
+saveRDS(bayes_validation_df, file = "bayes_output/full_validation_object_early2.rds")
+
+# Also export a trimmed summary version (for supplement)
+validation_summary <- data.frame(
+  Method = c("LOO", "WAIC"),
+  Est = c(loo_early2$estimates["elpd_loo", "Estimate"], waic_early2$estimates["elpd_waic", "Estimate"]),
+  SE = c(loo_early2$estimates["elpd_loo", "SE"], waic_early2$estimates["elpd_waic", "SE"]),
+  p_eff = c(loo_early2$estimates["p_loo", "Estimate"], waic_early2$estimates["p_waic", "Estimate"])
+)
+write.csv(validation_summary, "bayes_output/validation_summary_early2.csv", row.names = FALSE)
+
+# 5. Posterior samples — optional to save
+postsamp_early2 <- posterior_samples(did_brm_model_early2)
+saveRDS(postsamp_early2, "bayes_output/posterior_samples_early2.rds")
+
+# 6. Pairs Plot — for supplement if needed
+png("bayes_output/pairs_plot_early2.png", width = 1000, height = 1000)
+pairs(did_brm_model_early2)
+dev.off()
+
+
+
+fixef(did_brm_psm_early2) 
+
+conditional_effects(did_brm_psm_early2, effects = "did_time:did_treat")
+
+fixed_effects_early2 <- as.data.frame(fixef(did_brm_psm_early2))
+
+# Add term names as a column
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_early2 <- as_draws_df(did_brm_psm_early2)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_early2$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  mutate(prob_neg = mean(posterior_draws_early2$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_early2 = mean(posterior_draws_early2$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_early2 = 1 - prob_HR_less_early2  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+View(fixed_effects_early2)
+
+# Save to CSV
+write.csv(bayes_validation_df, "bayes_output/bayesian_model_validation_summary_early2.csv", row.names = FALSE)
+
+
+pairs_early2 = pairs(did_brm_psm_early2) 
+
+postsamp_early2 = posterior_samples(did_brm_psm_early2)
+
+
+
+
+
+fixef(did_brm_psm_early2) 
+
+
+conditional_effects(did_brm_psm_early2, effects = "did_time:did_treat")
+
+
+fixed_effects_early2 <- as.data.frame(fixef(did_brm_psm_early2))
+
+# Add term names as a column
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_early2 <- as_draws_df(did_brm_psm_early2)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_early2$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  mutate(prob_neg = mean(posterior_draws_early2$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_early2 = mean(posterior_draws_early2$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_early2 <- fixed_effects_early2 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_early2 = 1 - prob_HR_less_early2  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_early2)
+
+# Save as CSV
+write.csv(fixed_effects_early2, "bayes_nocovar/brm_fixed_effects_results_early2.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_early2, "bayes_nocovar/brm_fixed_effects_results_early2.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+
+
+### Bayesian 0v2 late ###
+
+seer_crc_did_psm_late2 <- readRDS("bayesian/inputs/matched_X_data_2_did_later_2.rds") %>%
+  filter(capped_time > 0) %>%
+  mutate(
+    capped_event = as.integer(capped_event),
+    did_time = factor(did_time, levels = c("Pre", "Post")),
+    did_treat = factor(did_treat, levels = c(0, 1))
+  )
+
+# Use cmdstanr backend
+options(brms.backend = "rstan")
+
+# Define priors (robust for coefficients, regularizing for group-level effects)
+priors <- c(
+  set_prior("student_t(3, 0, 2.5)", class = "b"),                     # general default
+  set_prior("exponential(1)", class = "sd"),                         # group-level variation
+  set_prior("exponential(1)", class = "shape"),                      # Weibull shape param
+  # set_prior("normal(0, 0.2)", class = "b", coef = "did_timePost:did_treat1") 
+  # set_prior("normal(0.1, 0.05)", class = "b", coef = "did_timePost:did_treat1")
+  set_prior("normal(0.15, 0.075)", class = "b", coef = "did_timePost:did_treat1")
+  # set_prior("normal(0.1, 0.1)", class = "b", coef = "did_timePost:did_treat1") # expect some effect but allow variability
+  # set_prior("student_t(3, 0, 2.5)", class = "b", coef = "did_timePost:did_treat1") # agnostic 
+)# informative for DiD
+
+
+# Define the model formula with covariates
+did_brm_psm_late2 <- bf(
+  capped_time | cens(1 - capped_event) ~ 
+    did_time * did_treat + 
+    #  age_category + Race + Combined.Stage + Marital_Grouped + Sex + 
+    #  Rural.Urban.Continuum.Code +
+    (1 | Medicaid.Expansion.Status)
+)
+
+# Fit the model
+did_brm_model_late2 <- brm(
+  formula = did_brm_psm_late2,
+  data = seer_crc_did_psm_late2,
+  family = weibull(),
+  prior = priors,
+  threads = threading(2),
+  # backend = "cmdstanr",
+  chains = 4,
+  cores = 4,
+  iter = 6000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  seed = 2025
+)
+
+# Save output
+saveRDS(did_brm_model_late2, file = "bayesian/out/did_brm_psm_late2.rds")
+
+did_brm_psm_late2 <- readRDS("bayesian/out/did_brm_psm_late2.rds")
+
+
+
+# Validation:
+sum_late2 = summary(did_brm_psm_late2)
+plot_late2 = plot(did_brm_psm_late2)  # trace and density plots
+
+pp_late2a = pp_check(did_brm_psm_late2)  # posterior predictive checks
+pp_late2b = pp_check(did_brm_psm_late2, type = "stat")
+pp_late2c = pp_check(did_brm_psm_late2, type = "stat_grouped", group = "did_treat")
+
+loo_late2 = loo(did_brm_psm_late2)  # Leave-One-Out Cross Validation
+waic_late2 = waic(did_brm_psm_late2)  # Widely Applicable Information 
+
+
+# Combine LOO and WAIC results
+bayes_validation_df <- rbind(loo_late2, waic_late2)
+
+# Save to CSV
+write.csv(bayes_validation_df, "bayes_output/bayesian_model_validation_summary_late2.csv", row.names = FALSE)
+
+
+pairs_late2 = pairs(did_brm_psm_late2) 
+
+postsamp_late2 = posterior_samples(did_brm_psm_late2)
+
+
+
+
+
+fixef(did_brm_psm_late2) 
+
+conditional_effects(did_brm_psm_late2, effects = "did_time:did_treat")
+
+fixed_effects_late2 <- as.data.frame(fixef(did_brm_psm_late2))
+
+# Add term names as a column
+fixed_effects_late2 <- fixed_effects_late2 %>%
+  tibble::rownames_to_column("term")
+
+# Extract posterior draws
+posterior_draws_late2 <- as_draws_df(did_brm_psm_late2)
+
+# Example: Posterior probability that the treatment effect is < 0
+mean(posterior_draws_late2$`b_did_timePost:did_treat1` < 0)
+
+# You can add this to your table if you want:
+fixed_effects_late2 <- fixed_effects_late2 %>%
+  mutate(prob_neg = mean(posterior_draws_late2$`b_did_timePost:did_treat1` < 0))
+
+fixed_effects_late2 <- fixed_effects_late2 %>%
+  mutate(
+    HR = exp(Estimate),
+    HR_lower = exp(Q2.5),
+    HR_upper = exp(Q97.5),
+    prob_HR_less_late2 = mean(posterior_draws_late2$`b_did_timePost:did_treat1` < 0)
+  )
+
+fixed_effects_late2 <- fixed_effects_late2 %>%
+  mutate(
+    HR_death = 1 / HR,
+    HR_death_lower = 1 / HR_upper,
+    HR_death_upper = 1 / HR_lower,
+    prob_HR_death_greater_late2 = 1 - prob_HR_less_late2  # since HR_survival < 1 ↔ HR_death > 1
+  )
+
+
+
+# # View the result in RStudio # Viewer (optional)
+View(fixed_effects_late2)
+
+# Save as CSV
+write.csv(fixed_effects_late2, "bayes_nocovar/brm_fixed_effects_results_late2.csv")
+
+# Save as plain text (tab-delimited)
+write.table(fixed_effects_late2, "bayes_nocovar/brm_fixed_effects_results_late2.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+## 8. Placebo Falsification for Parallel Trend Validation for Survival
+
+# Subset pre-expansion years only
+placebo_data <- cleaned_crc_1 %>%
+  filter(dx.yr_grouped %in% c("2006-2010"),   # Ensure dx.yr_grouped is treated as a string
+         Medicaid_Expansion_Status %in% c(0, 1)) %>%
+  mutate(
+    fake_time = ifelse(dx.yr == 2010, 1, 0),  # Pretend 2010 is "post"
+    treat = ifelse(Medicaid_Expansion_Status == 1, 1, 0)
+  ) %>%
+  drop_na(early_stage)
+
+# Run placebo DiD model
+placebo_model <- glm(early_stage ~ treat * fake_time, data = placebo_data, family = binomial())
+
+modelsummary(placebo_model, output = "stats/placebo_stage_model_output.docx")
+
+# Output
+tidy(placebo_model, conf.int = TRUE, exponentiate = TRUE)
+
+
+# Assuming you have already run tidy() on the placebo model
+placebo_tidy <- tidy(placebo_model, conf.int = TRUE, exponentiate = TRUE)
+
+# Save the tidy result as a CSV
+write.csv(placebo_tidy, "stats/placebofalse_stage.csv", row.names = FALSE)
+
+
+
+
